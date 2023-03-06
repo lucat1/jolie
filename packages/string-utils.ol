@@ -114,7 +114,13 @@ RequestResponse:
 	 * Returns true if the string contains .substring
 	 */
 	contains( ContainsRequest )( bool ),
+	/**!
+	 * Returns the index at which .word starts
+	 */
 	indexOf(IndexOfRequest)(IndexOfResponse),
+	/**!
+	 * Returns the substring starting at .start and ending at .end
+	 */
 	substring(SubStringRequest)(string),
 	join(JoinRequest)(string),
 	leftPad(PadRequest)(string),
