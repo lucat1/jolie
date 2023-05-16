@@ -48,35 +48,40 @@ import jolie.util.Helpers;
  * @see CommMessage
  */
 public abstract class CommChannel {
-	protected final ReentrantLock lock = new ReentrantLock( false );
+	protected final ReentrantLock rwLock = new ReentrantLock( false );
 
-	private boolean toBeClosed = true;
+	private volatile boolean toBeClosed = true;
 	private InputPort inputPort = null;
 	private OutputPort outputPort = null;
 	private boolean isOpen = true;
 
 	private long redirectionMessageId = 0L;
 
+	private final Object timeoutHandlerMutex = new Object();
 	private Future< ? > timeoutHandler = null;
 
 	protected boolean cancelTimeoutHandler() {
-		return Helpers.lockAndThen( lock, () ->
-		// true if there is no handler or if we can cancel it
-		timeoutHandler == null || timeoutHandler.cancel( false ) );
+		boolean result;
+		synchronized( timeoutHandlerMutex ) {
+			// true if there is no handler or if we can cancel it
+			result = timeoutHandler == null || timeoutHandler.cancel( false );
+			timeoutHandler = null;
+		}
+		return result;
 	}
 
 	protected void setTimeoutHandler( Runnable newTimeoutHandler, Interpreter interpreter, long delay ) {
-		Helpers.lockAndThen( lock, () -> {
+		synchronized( timeoutHandlerMutex ) {
 			// If there is no current handler or if we are still in time to cancel the current handler
 			if( timeoutHandler == null || timeoutHandler.cancel( false ) ) {
 				timeoutHandler = interpreter.schedule( () -> {
-					Helpers.lockAndThen( lock, () -> {
+					synchronized( timeoutHandlerMutex ) {
 						newTimeoutHandler.run();
 						this.timeoutHandler = null;
-					} );
+					}
 				}, delay );
 			}
-		} );
+		}
 	}
 
 	protected long redirectionMessageId() {
@@ -166,7 +171,14 @@ public abstract class CommChannel {
 	 * @return <code>true</code> if this channel is open, <code>false</code> otherwise
 	 */
 	public final boolean isOpen() {
-		return isOpen && isOpenImpl();
+		boolean result;
+		if( rwLock.tryLock() ) {
+			result = isOpen && isOpenImpl();
+			rwLock.unlock();
+		} else {
+			result = true;
+		}
+		return result;
 	}
 
 	protected boolean isOpenImpl() {
@@ -185,7 +197,7 @@ public abstract class CommChannel {
 	 */
 	public CommMessage recv()
 		throws IOException {
-		return Helpers.lockAndThen( lock, this::recvImpl );
+		return Helpers.lockAndThen( rwLock, this::recvImpl );
 	}
 
 	/**
@@ -207,7 +219,7 @@ public abstract class CommChannel {
 	public void send( final CommMessage message )
 		throws IOException {
 		try {
-			Helpers.lockAndThen( lock, () -> sendImpl( message ) );
+			Helpers.lockAndThen( rwLock, () -> sendImpl( message ) );
 		} catch( IOException e ) {
 			setToBeClosed( true );
 			throw e;
@@ -228,13 +240,11 @@ public abstract class CommChannel {
 	 */
 	public final void release()
 		throws IOException {
-		Helpers.lockAndThen( lock, () -> {
-			if( toBeClosed() ) {
-				close();
-			} else {
-				releaseImpl();
-			}
-		} );
+		if( toBeClosed() ) {
+			close();
+		} else {
+			releaseImpl();
+		}
 	}
 
 	protected void releaseImpl()
@@ -255,7 +265,8 @@ public abstract class CommChannel {
 	 */
 	public final void disposeForInput()
 		throws IOException {
-		Helpers.lockAndThen( lock, () -> {
+		// TODO: might be useless locking
+		Helpers.lockAndThen( rwLock, () -> {
 			if( toBeClosed() == false ) {
 				disposeForInputImpl();
 			} /*

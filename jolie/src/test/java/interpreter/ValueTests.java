@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 Fabrizio Montesi <famontesi@gmail.com>
+ * Copyright (C) 2023 Fabrizio Montesi <famontesi@gmail.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -17,30 +17,20 @@
  * MA 02110-1301  USA
  */
 
-from ..test-unit import TestUnitInterface
+package interpreter;
 
-/**
-	A template for test units.
-*/
-service Main {
-	inputPort TestUnitInput {
-		location: "local"
-		interfaces: TestUnitInterface
-	}
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import org.junit.jupiter.api.Test;
+import jolie.runtime.Value;
 
-	main {
-		test()() {
-			/*
-			* Write the code of your test here (replace nullProcess),
-			* and replace the first line of the copyright header with your data.
-			*
-			* The test is supposed to throw a TestFailed fault in case of a failure.
-			* You should add a description that reports what the failure was about,
-			* for example:
-			*
-			* throw( TestFailed, "string concatenation does not match correct result" )
-			*/
-			nullProcess
-		}
+class ValueTests {
+	@Test
+	void addition() {
+		var i1 = 222345;
+		var i2 = 551231;
+		var v1 = Value.create( i1 );
+		var v2 = Value.create( i2 );
+		v1.add( v2 );
+		assertEquals( v1.intValue(), i1 + i2, "wrong addition result" );
 	}
 }

@@ -24,6 +24,7 @@ import java.net.URI;
 import java.util.HashMap;
 import java.util.Map;
 import jolie.Interpreter;
+import jolie.util.Helpers;
 
 public class ChannelCache {
 	// Location URI -> Protocol name -> Persistent CommChannel object
@@ -45,46 +46,21 @@ public class ChannelCache {
 	}
 
 	public CommChannel getPersistentChannel( URI location, String protocol ) {
-		CommChannel ret = null;
 		synchronized( persistentChannels ) {
 			Map< String, CommChannel > protocolChannels = persistentChannels.get( location );
 			if( protocolChannels != null ) {
-				ret = protocolChannels.get( protocol );
+				final var ret = protocolChannels.get( protocol );
 				if( ret != null ) {
-					if( ret.lock.tryLock() ) {
-						if( ret.isOpen() ) {
-							/*
-							 * We are going to return this channel, but first check if it supports concurrent use. If
-							 * not, then others should not access this until the caller is finished using it.
-							 */
-							// if ( ret.isThreadSafe() == false ) {
-							removePersistentChannel( location, protocol, protocolChannels );
-							// } else {
-							// If we return a channel, make sure it will not timeout!
-							boolean available = ret.cancelTimeoutHandler();
-							// if ( ret.timeoutHandler() != null ) {
-							// interpreter.removeTimeoutHandler( ret.timeoutHandler() );
-							// ret.setTimeoutHandler( null );
-							// }
-							// }
-							ret.lock.unlock();
-							if( !available ) {
-								ret = null;
-							}
-						} else { // Channel is closed
-							removePersistentChannel( location, protocol, protocolChannels );
-							ret.lock.unlock();
-							ret = null;
-						}
-					} else { // Channel is busy
-						removePersistentChannel( location, protocol, protocolChannels );
-						ret = null;
+					removePersistentChannel( location, protocol, protocolChannels );
+					if( Helpers.tryLockOrElse( ret.rwLock, () -> ret.isOpen() && ret.cancelTimeoutHandler(),
+						() -> false ) ) {
+						return ret;
 					}
 				}
 			}
 		}
 
-		return ret;
+		return null;
 	}
 
 	public void putPersistentChannel( URI location, String protocol, final CommChannel channel,
@@ -112,8 +88,8 @@ public class ChannelCache {
 			try {
 				synchronized( persistentChannels ) {
 					removePersistentChannel( location, protocol, channel );
+					channel.close();
 				}
-				channel.close();
 			} catch( IOException e ) {
 				interpreter.logSevere( e );
 			}

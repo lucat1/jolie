@@ -26,9 +26,10 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
 import jolie.ExecutionThread;
 import jolie.Interpreter;
 import jolie.lang.Constants;
@@ -36,65 +37,56 @@ import jolie.runtime.FaultException;
 import jolie.runtime.Value;
 
 public abstract class AbstractCommChannel extends CommChannel {
-	private static final long RECEIVER_KEEP_ALIVE = 20000; // msecs
-
 	private final Map< Long, CommMessage > pendingResponses = new HashMap<>();
-	private final Map< Long, ResponseContainer > waiters = new HashMap<>();
 	private final List< CommMessage > pendingGenericResponses = new LinkedList<>();
+	private final Map< Long, CompletableFuture< CommMessage > > waiters = new HashMap<>();
 	private ResponseReceiver responseReceiver = null;
 	private final Object responseRecvMutex = new Object();
 
-	private static class ResponseContainer {
-		private ResponseContainer() {}
+	private Optional< CommMessage > removeResponseFromCache( CommMessage request ) {
+		final Optional< CommMessage > result;
 
-		private CommMessage response = null;
+		var response = pendingResponses.remove( request.requestId() );
+		if( response != null ) {
+			result = Optional.of( response );
+		} else if( !pendingGenericResponses.isEmpty() ) {
+			result = Optional.of( pendingGenericResponses.remove( 0 ) );
+		} else {
+			result = Optional.empty();
+		}
+
+		return result;
+	}
+
+	private void startResponseReceiver() {
+		final var ethread = ExecutionThread.currentThread();
+		if( responseReceiver == null ) {
+			// If there is no receiver yet, start a new one
+			responseReceiver = new ResponseReceiver( this, ethread );
+			ethread.interpreter().commCore().startCommChannelHandler( responseReceiver );
+		} else {
+			// If there is already a receiver running, reset its timeout
+			responseReceiver.resetTimeout();
+		}
 	}
 
 	@Override
 	public Future< CommMessage > recvResponseFor( CommMessage request )
 		throws IOException {
-		final ExecutionThread ethread = ExecutionThread.currentThread();
-		return CompletableFuture.supplyAsync( () -> {
-			CommMessage response;
-			ResponseContainer monitor = null;
-			synchronized( responseRecvMutex ) {
-				response = pendingResponses.remove( request.requestId() );
-				if( response == null ) {
-					if( pendingGenericResponses.isEmpty() ) {
-						assert (waiters.containsKey( request.requestId() ) == false);
-						monitor = new ResponseContainer();
-						waiters.put( request.requestId(), monitor );
-						// responseRecvMutex.notify();
-					} else {
-						response = pendingGenericResponses.remove( 0 );
-					}
-				}
-			}
-			if( response == null ) {
-				synchronized( responseRecvMutex ) {
-					if( responseReceiver == null ) {
-						responseReceiver = new ResponseReceiver( this, ethread );
-						ethread.interpreter().commCore().startCommChannelHandler( responseReceiver );
-					} else {
-						responseReceiver.wakeUp();
-					}
-				}
+		synchronized( responseRecvMutex ) {
+			var optResponse = removeResponseFromCache( request );
+			if( optResponse.isPresent() ) {
+				return CompletableFuture.completedFuture( optResponse.get() );
+			} else {
+				assert !waiters.containsKey( request.requestId() );
+				var responseFuture = new CompletableFuture< CommMessage >();
+				waiters.put( request.requestId(), responseFuture );
 
-				if( monitor != null ) {
-					synchronized( monitor ) {
-						if( monitor.response == null ) {
-							try {
-								monitor.wait();
-							} catch( InterruptedException e ) {
-								ethread.interpreter().logSevere( e );
-							}
-						}
-						response = monitor.response;
-					}
-				}
+				startResponseReceiver();
+
+				return responseFuture;
 			}
-			return response;
-		}, Interpreter.getInstance().commCore().executor() );
+		}
 	}
 
 	private static class ResponseReceiver implements Runnable {
@@ -110,90 +102,65 @@ public abstract class AbstractCommChannel extends CommChannel {
 			this.timeoutHandler = null;
 		}
 
-		private void timeout() {
-			synchronized( parent.responseRecvMutex ) {
-				if( keepRun == false ) {
-					if( parent.waiters.isEmpty() ) {
-						timeoutHandler = null;
-						parent.responseReceiver = null;
-					} else {
-						keepRun = true;
-					}
-					parent.responseRecvMutex.notify();
-				}
-			}
-		}
-
-		// protected by responseRecvMutex
-		private void wakeUp() {
+		// Requires: synchronized on parent.responseRecvMutex
+		private void resetTimeout() {
 			if( timeoutHandler != null ) {
 				timeoutHandler.cancel( false ); // TODO: What if this fails?
 			}
-			keepRun = true;
-			parent.responseRecvMutex.notify();
+			timeoutHandler = ethread.interpreter().schedule( this::timeout, ethread.interpreter().responseTimeout() );
 		}
 
-		// protected by responseRecvMutex
-		private void sleep() {
-			timeoutHandler = ethread.interpreter().schedule( this::timeout, RECEIVER_KEEP_ALIVE );
-			try {
-				keepRun = false;
-				parent.responseRecvMutex.wait();
-			} catch( InterruptedException e ) {
-				Interpreter.getInstance().logSevere( e );
+		private void timeout() {
+			synchronized( parent.responseRecvMutex ) {
+				parent.waiters.forEach( ( requestId, messageFuture ) -> {
+					messageFuture.completeExceptionally( new TimeoutException( "Channel timed out" ) );
+				} );
+				parent.waiters.clear();
+				try {
+					parent.close();
+				} catch( IOException e ) {
+					Interpreter.getInstance().logWarning( e );
+				}
 			}
 		}
 
 		private void handleGenericMessage( CommMessage response ) {
-			ResponseContainer monitor;
 			if( parent.waiters.isEmpty() ) {
 				parent.pendingGenericResponses.add( response );
 			} else {
-				Entry< Long, ResponseContainer > entry =
+				var entry =
 					parent.waiters.entrySet().iterator().next();
-				monitor = entry.getValue();
+				var responseFuture = entry.getValue();
 				parent.waiters.remove( entry.getKey() );
-				synchronized( monitor ) {
-					monitor.response = new CommMessage(
+				responseFuture.complete(
+					new CommMessage(
 						entry.getKey(),
 						response.operationName(),
 						response.resourcePath(),
 						response.value(),
-						response.fault() );
-					monitor.notify();
-				}
+						response.fault() ) );
 			}
 		}
 
 		private void handleMessage( CommMessage response ) {
-			ResponseContainer monitor;
-			if( (monitor = parent.waiters.remove( response.requestId() )) == null ) {
-				parent.pendingResponses.put( response.requestId(), response );
+			var responseFuture = parent.waiters.remove( response.requestId() );
+			if( responseFuture != null ) {
+				responseFuture.complete( response );
 			} else {
-				synchronized( monitor ) {
-					monitor.response = response;
-					monitor.notify();
-				}
+				parent.pendingResponses.put( response.requestId(), response );
 			}
 		}
 
 		private void throwIOExceptionFault( IOException e ) {
-			if( parent.waiters.isEmpty() == false ) {
-				ResponseContainer monitor;
-				for( Entry< Long, ResponseContainer > entry : parent.waiters.entrySet() ) {
-					monitor = entry.getValue();
-					synchronized( monitor ) {
-						monitor.response = new CommMessage(
-							entry.getKey(),
-							"",
-							Constants.ROOT_RESOURCE_PATH,
-							Value.create(),
-							new FaultException( "IOException", e ) );
-						monitor.notify();
-					}
-				}
-				parent.waiters.clear();
+			for( var entry : parent.waiters.entrySet() ) {
+				entry.getValue().complete( new CommMessage(
+					entry.getKey(),
+					"",
+					Constants.ROOT_RESOURCE_PATH,
+					Value.create(),
+					new FaultException( "IOException", e ) ) );
 			}
+			parent.waiters.clear();
 		}
 
 		@Override
@@ -207,23 +174,34 @@ public abstract class AbstractCommChannel extends CommChannel {
 			CommMessage response;
 			while( keepRun ) {
 				synchronized( parent.responseRecvMutex ) {
-					try {
-						response = parent.recv();
-						if( response != null ) {
+					resetTimeout();
+				}
+				try {
+					response = parent.recv();
+					if( response != null ) {
+						synchronized( parent.responseRecvMutex ) {
 							if( response.hasGenericRequestId() ) {
 								handleGenericMessage( response );
 							} else {
 								handleMessage( response );
 							}
 						}
+					}
+					synchronized( parent.responseRecvMutex ) {
 						if( parent.waiters.isEmpty() ) {
-							sleep();
+							keepRun = false;
+							parent.responseReceiver = null;
+							timeoutHandler.cancel( false );
 						}
-					} catch( IOException e ) {
+					}
+				} catch( IOException e ) {
+					synchronized( parent.responseRecvMutex ) {
 						throwIOExceptionFault( e );
 						keepRun = false;
 						parent.responseReceiver = null;
+						timeoutHandler.cancel( false );
 					}
+					// TODO: close the channel?
 				}
 			}
 		}

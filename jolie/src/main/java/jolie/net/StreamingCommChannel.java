@@ -21,12 +21,10 @@
 
 package jolie.net;
 
-import jolie.net.ports.OutputPort;
-import jolie.net.protocols.CommProtocol;
-import jolie.util.Helpers;
-
 import java.io.IOException;
 import java.net.URI;
+import jolie.net.ports.OutputPort;
+import jolie.net.protocols.CommProtocol;
 
 /**
  * This abstract class implements a communication channel based on a <code>CommProtocol</code>.
@@ -56,11 +54,11 @@ public abstract class StreamingCommChannel extends AbstractCommChannel {
 	@Override
 	protected void releaseImpl()
 		throws IOException {
-		Helpers.lockAndThen( lock,
-			() -> {
-				if( parentPort() instanceof OutputPort ) {
-					((OutputPort) parentPort()).putPersistentChannel( location, protocol.name(), this );
-				}
-			} );
+		// Helpers.lockAndThen( lock,
+		// () -> {
+		if( parentPort() instanceof OutputPort ) {
+			((OutputPort) parentPort()).putPersistentChannel( location, protocol.name(), this );
+		}
+		// } );
 	}
 }
